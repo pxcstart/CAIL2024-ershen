@@ -7,61 +7,48 @@ import argparse
 import torch
 import json
 
-
-class FTDataset(Dataset):
-    def __init__(self, tokenizer, dataset):
-        super(FTDataset, self).__init__()
+class CustomDataset(Dataset):
+    def __init__(self, data, tokenizer, max_length=1024):
+        self.data = data
         self.tokenizer = tokenizer
-        self.dataset = dataset
+        self.max_length = max_length
 
-    def add_eos_token(self, result):
-        result["input_ids"].append(self.tokenizer.eos_token_id)
-        result["labels"].append(self.tokenizer.eos_token_id)
-        result["attention_mask"].append(1)
-        return result
-    
-    def list2tensor(self, result):
-        for key, value in result.items():
-            result[key] = torch.tensor(value)
-        return result
-    
-    def tokenize(self, prompt, add_eos_token=False):
-        result = self.tokenizer(
-            prompt,
-            truncation=True,
-            max_length=2048,
-            padding=False,
-            return_tensors=None,
-        )
-        if (result["input_ids"][-1] != self.tokenizer.eos_token_id and len(result["input_ids"]) < 2048 and add_eos_token):
-            result["input_ids"].append(self.tokenizer.eos_token_id)
-            result["attention_mask"].append(1)
-        result["labels"] = result["input_ids"].copy()
-        return result
-
-    def qa_tokenize(self, message): # message格式：[{"role":user, "content":Q}, {"role":assistant, "content":A}]
-        qa_input = self.tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
-        qa_tokens = self.tokenize(qa_input, add_eos_token=True)
-        q_input = self.tokenizer.apply_chat_template(message[:2], tokenize=False, add_generation_prompt=True)
-        q_tokens = self.tokenize(q_input, add_eos_token=False)
-        qa_tokens["labels"] = [-100] * len(q_tokens["input_ids"]) + qa_tokens["labels"][len(q_tokens["input_ids"]):]
-        return self.list2tensor(qa_tokens)
-
-    def __getitem__(self, index):
-        sample = self.dataset[index]
-        token_res = self.qa_tokenize(sample)
-        return token_res
-    
     def __len__(self):
-        return len(self.dataset)
+        return len(self.data)
 
+    def __getitem__(self, idx):
+        example = self.data[idx]
+        prompt = f"<|im_start|>system\n{example[0]['content']}<|im_end|>\n<|im_start|>user\n{example[1]['content']}<|im_end|>\n<|im_start|>assistant\n"
+        completion = f"{example[2]['content']}<|im_end|>"
+
+        # Tokenize prompt and completion
+        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        completion_ids = self.tokenizer.encode(completion, add_special_tokens=False)
+
+        # Combine prompt and completion
+        input_ids = prompt_ids + completion_ids
+
+        # Truncate or pad to max_length
+        input_ids = input_ids[:self.max_length]
+        labels = [-100] * len(prompt_ids) + completion_ids
+        labels = labels[:self.max_length]
+
+        # Ensure padding matches lengths
+        padding_length = self.max_length - len(input_ids)
+        input_ids += [self.tokenizer.pad_token_id] * padding_length
+        labels += [-100] * padding_length
+
+        return {
+            'input_ids': torch.tensor(input_ids, dtype=torch.long),
+            'labels': torch.tensor(labels, dtype=torch.long),
+            'attention_mask': torch.tensor([1] * (self.max_length - padding_length) + [0] * padding_length, dtype=torch.long)
+        }
 
 if __name__=="__main__":
     parser = argparse.ArgumentParser(description="ChatLaw")
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--epochs", type=int, default=4)
-    parser.add_argument("--warmup_epochs", type=int, default=2)
     args = parser.parse_args()
 
     quantization_config = BitsAndBytesConfig(
@@ -96,33 +83,24 @@ if __name__=="__main__":
         reference = sample[2]["content"]
         references.append(reference)
     
-    train_dataset = FTDataset(tokenizer, trainset)
-    # test_dataset = FTDataset(tokenizer, testset, "test")
-    collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
-    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collator)
-    # test_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=collator)
+    dataset = CustomDataset(trainset, tokenizer)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-    # 模型训练
-    optimizer = AdamW(model.parameters(), lr=args.lr)
-    result = []
+    # Set optimizer
+    optimizer = AdamW(model.parameters(), lr=5e-5)
+    # Training loop
+    model.train()
     for epoch in range(args.epochs):
-        model.train()
-        progress_bar = tqdm(train_dataloader, desc=f"Train Epoch {epoch+1}/{args.epochs}", leave=False)
-        epoch_loss = 0
-        for step, inputs in enumerate(progress_bar):
-            inputs = {k: v.to("cuda") for k, v in inputs.items()}
-            outputs = model(**inputs)
-            loss = outputs.loss 
-            epoch_loss += loss.item()
-            if torch.isnan(loss):  # check
-                breakpoint()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)  # 梯度裁剪
-            optimizer.step()
+        epoch_loss = 0 
+        for batch in tqdm(dataloader):
             optimizer.zero_grad()
-        print(f"Epoch {epoch+1}/{args.epochs}, Loss: {epoch_loss/len(train_dataloader)}")
-            
-    model.save_pretrained("./model/finetune/")
-
-
-    
+            outputs = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'], labels=batch['labels'])
+            loss = outputs.loss
+            epoch_loss += loss.item()
+            loss.backward()
+            optimizer.step()
+        epoch_loss /= len(dataloader)/args.batch_size
+        print(f"Epoch {epoch} Loss: {epoch_loss}")
+    # Save model
+    model.save_pretrained("./model/finetune")
+    tokenizer.save_pretrained("./model/finetune")
